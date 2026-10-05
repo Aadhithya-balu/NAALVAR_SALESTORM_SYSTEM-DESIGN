@@ -1,547 +1,1125 @@
-# SALESTORM — Requirements & Assumptions Document
+# SALESTORM — Requirements & Assumptions
+
 ### High-Scale E-Commerce Flash Sale
+
 **SYSCRAFTERS 2026 — Design-First, AI-Assisted System Design Hackathon**
 
 ---
 
-## Document Control & Metadata
+## Document Information
 
-| Attribute | Details |
-| :--- | :--- |
-| **Document Title** | SALESTORM — Requirements & Assumptions Document |
-| **Project** | SYSCRAFTERS 2026 Hackathon (Design-First, AI-Assisted System Design) |
-| **Document Version** | 1.0.0 |
-| **Status** | Approved Architectural Baseline |
-| **Target Audience** | System Architects, Lead Engineers, Domain Reviewers |
-| **Downstream Deliverables** | `02_HLD`, `03_LLD`, `04_Database`, `05_API`, `08_Scalability_Reliability`, `09_Security_Observability`, `10_ADR` |
+| Attribute            | Details                                                                                                             |
+| :------------------- | :------------------------------------------------------------------------------------------------------------------ |
+| **Project**          | SALESTORM                                                                                                           |
+| **Hackathon**        | SYSCRAFTERS 2026                                                                                                    |
+| **Document Version** | 1.0.0                                                                                                               |
+| **Status**           | Approved Architectural Baseline                                                                                     |
+| **Purpose**          | Define the business requirements, system expectations, assumptions, constraints, and success criteria for SALESTORM |
+| **Next Documents**   | HLD, LLD, Database Design, API Design, Scalability & Reliability, Security & Observability, ADRs                    |
 
 ---
 
-## 1. Business Problem
+# 1. Business Problem
 
-### 1.1 Context & Core Business Question
-SALESTORM is an enterprise-grade, high-volume e-commerce platform designed to orchestrate high-velocity flash-sale events. During these events, a massive influx of concurrent customers converges on an extremely scarce catalog of high-demand items.
+## 1.1 What is SALESTORM?
 
-The central architectural and business challenge is formulated as:
-> *"How can we handle thousands of simultaneous purchase requests for limited inventory without overselling, while keeping payment and order processing reliable, consistent, and idempotent under adverse network and service failure conditions?"*
+SALESTORM is a high-scale e-commerce platform designed to handle flash-sale events where a very large number of customers compete for a very limited number of products.
 
-### 1.2 The Critical Flash-Sale Scenario
-The system design is anchored around a benchmark critical scenario:
-* **Concurrent Contenders:** $10,000$ active buyers submitting purchase requests concurrently.
-* **Available Stock:** Exactly $100$ physical inventory units available for allocation.
-* **Inventory Invariant:** Zero overselling permitted under any concurrency or failure condition ($\text{Total Reserved} \le 100$).
-* **Transaction Safety:** Absolute prevention of duplicate reservations, double charges, and duplicate orders.
-* **Lifecycle Resilience:** Temporary inventory reservations must auto-expire upon customer abandonment or payment timeout, safely returning stock to the pool.
-* **Fault Tolerance:** End-to-end consistency across inventory, payment, and order state machines even when intermediate downstream services experience prolonged outages.
+The main challenge is simple to describe but difficult to solve:
 
-### 1.3 High-Level Business Pipeline
-The customer journey follows an end-to-end business pipeline spanning discovery through fulfillment:
+> **How do we allow thousands of customers to purchase a limited-stock product at the same time without overselling, double-charging customers, or losing orders when parts of the system fail?**
 
-```
+For example, imagine a flash sale where:
+
+* 10,000 customers try to purchase the same product at almost the same time.
+* Only 100 units are available.
+* All 10,000 requests may reach the system within seconds.
+* Some customers will retry because of slow networks or duplicate clicks.
+* The payment gateway may timeout or become temporarily unavailable.
+* Internal services may fail after payment has already succeeded.
+
+SALESTORM is designed around handling exactly these situations.
+
+---
+
+## 1.2 Critical Flash-Sale Scenario
+
+The main benchmark used throughout the design is:
+
+* **10,000 concurrent buyers**
+* **100 units of inventory**
+* **Zero overselling allowed**
+* **Exactly one successful reservation per available unit**
+* **No duplicate payments**
+* **No duplicate orders**
+* **Expired reservations must eventually return to inventory**
+* **Successful payments must not be lost even if downstream services are temporarily unavailable**
+
+The key inventory rule is:
+
+**Confirmed orders + active reservations must never exceed available stock.**
+
+For the benchmark scenario:
+
+**Maximum successful allocations = 100**
+
+The remaining requests must be rejected cleanly rather than allowing the system to oversell.
+
+---
+
+# 2. Customer Purchase Journey
+
+The overall customer journey looks like this:
+
+```text
 Customer
-  │
-  ▼
-[ Product Discovery ] ──► [ Cart Management ]
-                               │
-                               ▼
-                    [ Inventory Check ]
-                               │
-                               ▼
-                 [ Inventory Reservation ]
-                               │
-                               ▼
-                      [ Checkout Flow ]
-                               │
-                               ▼
-                     [ Payment Gateway ]
-                               │
-            ┌──────────────────┴──────────────────┐
-            ▼                                     ▼
-     (Payment Succeeded)                   (Payment Failed/Timeout)
-            │                                     │
-            ▼                                     ▼
-     [ Order Creation ]                   [ Release Reservation ]
-            │                                     │
-            ▼                                     ▼
-     [ Fulfillment ]                       (Stock Restored)
-            │
-            ▼
-     [ Shipment & Logistics ]
-            │
-            ▼
-     [ Customer Notification ]
-            │
-            ▼
-     [ Delivery Tracking ]
+   │
+   ▼
+Product Discovery
+   │
+   ▼
+Cart
+   │
+   ▼
+Inventory Check
+   │
+   ▼
+Inventory Reservation
+   │
+   ▼
+Checkout
+   │
+   ▼
+Payment
+   │
+   ├─────────────── Payment Success ───────────────┐
+   │                                               │
+   ▼                                               ▼
+Payment Failed / Timeout                     Order Creation
+   │                                               │
+   ▼                                               ▼
+Release Reservation                         Fulfillment
+   │                                               │
+   ▼                                               ▼
+Stock Available Again                    Shipment & Tracking
+                                                   │
+                                                   ▼
+                                             Notifications
+```
+
+The important distinction is that **adding a product to a cart does not reserve stock**.
+
+Inventory is reserved only when the customer actually enters the purchase flow.
+
+---
+
+# 3. System Objectives
+
+SALESTORM should achieve the following goals:
+
+### 1. Handle sudden traffic spikes
+
+The platform should absorb large flash-sale traffic surges without allowing the spike to take down the core transaction services.
+
+### 2. Protect inventory
+
+Inventory is the most important consistency boundary. The system must never allocate more physical units than actually exist.
+
+### 3. Use temporary reservations
+
+Once a customer starts checkout, their inventory can be held temporarily so another customer cannot take it while payment is being completed.
+
+### 4. Release abandoned inventory
+
+If a customer abandons checkout, payment fails, or a reservation expires, the reserved stock must eventually become available again.
+
+### 5. Make operations idempotent
+
+Network retries and duplicate clicks are expected. Repeating the same request must not create another reservation, payment, or order.
+
+### 6. Keep order and payment states consistent
+
+Payment, reservation, and order states must follow clearly defined state machines.
+
+### 7. Recover automatically from failures
+
+Temporary failures should result in retries, reconciliation, or compensation rather than permanently stuck transactions.
+
+### 8. Scale horizontally
+
+Stateless services should be able to scale by adding more instances instead of relying on a single application server.
+
+### 9. Protect the system from abuse
+
+Rate limiting, authentication, authorization, bot protection, and secure service-to-service communication should protect the platform during normal and extreme traffic.
+
+### 10. Make the architecture easy to implement
+
+The final design should be detailed enough that an engineering team can use it as a practical implementation blueprint.
+
+---
+
+# 4. Functional Requirements
+
+## 4.1 Product Discovery
+
+Users should be able to browse and search the product catalog without going through the transactional inventory system.
+
+The system should provide:
+
+* Product name and description
+* Images
+* Price
+* Flash-sale schedule
+* Basic availability information
+
+Availability shown during browsing does not have to be perfectly real-time. A small amount of delay is acceptable because the actual inventory check happens during reservation.
+
+Possible availability states:
+
+```text
+IN_STOCK
+LOW_STOCK
+SOLD_OUT
 ```
 
 ---
 
-## 2. System Objectives
+## 4.2 Cart Management
 
-The SALESTORM platform must achieve the following eleven core architectural objectives:
+Authenticated customers should be able to:
 
-1. **Traffic Surge Elasticity:** Ingest and arbitrate massive traffic spikes gracefully without system degradation or cascading outages.
-2. **Strict Inventory Allocation:** Guarantee mathematical non-overselling ($\text{Stock} \ge 0$) under extreme write contention.
-3. **Deterministic Temporary Reservations:** Implement time-bounded inventory holding to balance high conversion with stock starvation prevention.
-4. **Automated Compensation & Reclamation:** Reclaim reserved stock reliably upon checkout abandonment, client timeouts, or payment failures.
-5. **Universal Transaction Idempotency:** Guarantee that repeated invocations across network retries or client double-submissions produce exactly one side effect.
-6. **Duplicate Transaction Immunity:** Prevent concurrent or sequential duplicate reservation attempts and duplicate payment attempts from the same principal.
-7. **Deterministic Order Lifecycle:** Maintain strict, auditable state machine transitions across all order stages.
-8. **Asynchronous Fault Recovery:** Recover state smoothly from partial network partitions, downstream payment timeouts, and service outages without human intervention or data corruption.
-9. **Horizontal Scalability:** Ensure compute and read tiers scale horizontally across nodes without introducing shared-memory bottlenecks.
-10. **Zero-Trust Observability & Defense:** Ensure end-to-end distributed tracing, metrics, audit trails, mutual TLS, and rate-limiting at network perimeters.
-11. **Production-Grade Blueprint Clarity:** Provide an architectural design that is unambiguous, operationally defensible, and directly implementable by engineering teams.
+* Add products to their cart
+* Change quantities
+* Remove products
+* Continue using the cart across sessions
 
----
+A cart represents **customer intent**, not ownership of inventory.
 
-## 3. Functional Requirements
+Therefore:
 
-### 3.1 Customer & Product Discovery
-* **FR-DISC-001 (Catalog Access):** The system shall allow unauthenticated and authenticated users to browse, search, and retrieve product catalog details.
-* **FR-DISC-002 (Product Detail Retrieval):** The system shall return metadata including title, description, imagery, price, and active sale window schedules.
-* **FR-DISC-003 (Availability Visibility):** The system shall expose stock availability indicators (e.g., `IN_STOCK`, `LOW_STOCK`, `SOLD_OUT`). Availability data in the discovery path may be eventually consistent with bounded staleness to decouple catalog browsing from core transaction databases.
-
-### 3.2 Cart Management
-* **FR-CART-001 (Cart Mutation):** The system shall enable authenticated customers to add, modify quantity of, or remove catalog items from their persistent cart.
-* **FR-CART-002 (Cart State Persistence):** The system shall maintain cart state across client sessions.
-* **FR-CART-003 (Soft Decoupling):** Adding an item to the shopping cart shall *not* reserve inventory. Cart state represents customer intent, not an inventory reservation.
-
-### 3.3 Inventory Management
-* **FR-INV-001 (Atomic Stock Check):** The system shall evaluate real-time available inventory prior to executing reservation requests.
-* **FR-INV-002 (Atomic Stock Reservation):** The system shall execute atomic reservation decrements against verified stock balances.
-* **FR-INV-003 (Permanent Reservation Confirmation):** The system shall permanently convert a temporary reservation to a finalized sold state upon receipt of a verified payment confirmation.
-* **FR-INV-004 (Explicit Reservation Release):** The system shall release reserved stock back into the available pool immediately upon payment rejection or client cancellation.
-* **FR-INV-005 (Automated Expiry Release):** The system shall detect unconfirmed reservations whose time-to-live (TTL) has elapsed and reclaim the stock.
-* **FR-INV-006 (Strict Non-Negative Invariant):** Under no condition—including race conditions, concurrent node operations, or replay attacks—shall the inventory balance drop below zero ($Inventory \ge 0$).
-
-### 3.4 Reservation Lifecycle
-The system shall enforce a deterministic reservation state machine with unambiguous valid transitions and rigid failure paths.
-
-```
-       [ AVAILABLE ]
-             │
-             │ (1) Reserve Stock (Atomic Decrement)
-             ▼
-        [ RESERVED ]
-             │
-             │ (2) Initiate Payment Handshake
-             ▼
-    [ PAYMENT_PENDING ]
-             │
-      ┌──────┴──────────────────────────────┐
-      │ (3a) Payment Succeeded             │ (3b) Payment Failed / Timeout / Expired
-      ▼                                     ▼
- [ CONFIRMED ]                         [ RELEASED ]
-      │                                     │
-      │ (4) Fulfillment Initiated           │ (Stock Returned to Available Pool)
-      ▼                                     ▼
-   [ SOLD ]                           [ AVAILABLE ]
-```
-
-#### Valid State Transitions:
-1. `AVAILABLE` $\rightarrow$ `RESERVED`: Initiated when customer enters checkout with valid stock available.
-2. `RESERVED` $\rightarrow$ `PAYMENT_PENDING`: Initiated when checkout dispatches the payment authorization request to the payment gateway.
-3. `PAYMENT_PENDING` $\rightarrow$ `CONFIRMED`: Triggered when the payment provider issues a cryptographically verified success notification.
-4. `CONFIRMED` $\rightarrow$ `SOLD`: Triggered when the confirmed order transitions into the physical fulfillment pipeline.
-
-#### Valid Failure & Compensation Transitions:
-* **Failure Path A (Payment Failure):** `RESERVED` / `PAYMENT_PENDING` $\rightarrow$ `PAYMENT_FAILED` $\rightarrow$ `RELEASED` $\rightarrow$ `AVAILABLE`.
-* **Failure Path B (TTL Expiration / Timeout):** `RESERVED` / `PAYMENT_PENDING` $\rightarrow$ `TIMEOUT` $\rightarrow$ `RELEASED` $\rightarrow$ `AVAILABLE`.
-
-#### Prohibited Transitions:
-* `RELEASED` $\rightarrow$ `CONFIRMED` (Illegal: Expired or released stock cannot be confirmed).
-* `SOLD` $\rightarrow$ `AVAILABLE` (Illegal: Sold inventory cannot be reclaimed without a dedicated return/refund business process).
-* `AVAILABLE` $\rightarrow$ `CONFIRMED` (Illegal: Direct confirmation without active reservation bypasses concurrency controls).
-
-### 3.5 Checkout Flow
-* **FR-CHK-001 (Checkout Session Initiation):** The system shall create an immutable Checkout Session linking customer ID, product items, pricing snapshots, and shipping addresses.
-* **FR-CHK-002 (Active Reservation Binding):** The system shall verify that an active, non-expired reservation token is bound to the Checkout Session prior to initiating payment.
-* **FR-CHK-003 (Downstream Payment Dispatch):** The system shall generate a secure, idempotent payment transaction token and hand off execution to the Payment Gateway interface.
-
-### 3.6 Payment Processing
-* **FR-PAY-001 (Payment Success Handling):** Upon receiving synchronous or asynchronous payment authorization success, the system shall atomically mark the payment record as `SETTLED` and trigger order confirmation.
-* **FR-PAY-002 (Payment Failure Handling):** Upon receiving definitive payment rejection (e.g., insufficient funds, fraud flag), the system shall immediately mark the payment as `FAILED` and trigger inventory release.
-* **FR-PAY-003 (Payment Timeout Resolution):** In the event of gateway timeouts or missing callbacks, the payment status shall enter `UNKNOWN_PENDING` and initiate automated polling or webhook reconciliation.
-* **FR-PAY-004 (Deterministic Retry Policy):** Retries against payment gateways shall reuse the identical idempotency key to prevent double charging.
-* **FR-PAY-005 (Payment Reconciliation):** An out-of-band reconciliation mechanism shall audit lingering `PAYMENT_PENDING` records against external payment gateway settlement logs.
-* **FR-PAY-006 (Duplicate Payment Prevention):** Concurrent or sequential payment execution requests bearing the same checkout or transaction identifier shall be rejected or deduplicated at the boundary.
-
-### 3.7 Order Lifecycle
-The system shall manage the customer order via an auditable, append-only or transition-checked order state machine:
-
-```
-[ CREATED ] ──► [ PAYMENT_PENDING ] ──► [ CONFIRMED ] ──► [ PROCESSING ]
-                                              │
-                                              ▼
-                                         [ SHIPPED ] ──► [ OUT_FOR_DELIVERY ] ──► [ DELIVERED ]
-```
-
-* **FR-ORD-001 (Creation):** Orders are created in `CREATED` status upon checkout submission.
-* **FR-ORD-002 (Payment Binding):** Order advances to `PAYMENT_PENDING` while awaiting gateway settlement.
-* **FR-ORD-003 (Order Confirmation):** Order advances to `CONFIRMED` only upon verified payment confirmation and confirmed inventory allocation.
-* **FR-ORD-004 (Downstream State Progression):** Downstream logistics advance the order strictly through `PROCESSING` $\rightarrow$ `SHIPPED` $\rightarrow$ `OUT_FOR_DELIVERY` $\rightarrow$ `DELIVERED`.
-* **FR-ORD-005 (State Transition Guards):** Any out-of-sequence event (e.g., receiving `SHIPPED` before `CONFIRMED`, or moving `CANCELLED` to `DELIVERED`) shall be rejected with an audit alert.
-
-### 3.8 Fulfillment & Shipment
-* **FR-FUL-001 (Fulfillment Trigger):** The fulfillment pipeline shall be triggered strictly upon receipt of an immutable `OrderConfirmedEvent`.
-* **FR-FUL-002 (Shipment Lifecycle Tracking):** The system shall track external logistics carrier milestones (label generated, picked up, in-transit, out for delivery, delivered).
-* **FR-FUL-003 (Asynchronous Decoupling):** Fulfillment and shipment processing shall operate asynchronously from the core purchase checkout loop.
-
-### 3.9 Notifications
-* **FR-NOTIF-001 (Event-Driven Triggers):** The notification service shall publish customer-facing communications (Email, SMS, Push) for key lifecycle milestones (`Order Confirmed`, `Payment Failed`, `Item Shipped`, `Out for Delivery`).
-* **FR-NOTIF-002 (Non-Blocking Guarantee):** All notification processing shall be strictly asynchronous and decoupled via message broker topics. Notification delivery delays or vendor failures must have zero impact on inventory reservation, payment processing, or order creation.
-
-### 3.10 Universal Idempotency
-* **FR-IDEM-001 (Idempotency Key Specification):** All mutating requests across the purchase flow (Reservation, Checkout, Payment, Order Creation) must mandate a client-supplied or gateway-generated unique idempotency token (`Idempotency-Key`).
-* **FR-IDEM-002 (Deduplication Enforcement):** The receiving service boundary shall record processed idempotency keys. Re-executing an operation with an active or already processed key shall return the original cached response without re-executing business logic or state mutations.
-* **FR-IDEM-003 (Key Scope & Collision Avoidance):** Idempotency keys shall be scoped by tenant/user and operation type, with deterministic expiration windows matching transaction lifecycles.
+> **Adding an item to a cart must not reserve inventory.**
 
 ---
 
-## 4. Non-Functional Requirements (NFRs)
+# 5. Inventory & Reservation
 
-The following measurable matrix defines the non-functional criteria governing the SALESTORM platform:
+Inventory is the most critical part of SALESTORM.
 
-| Category | Requirement ID | Metric / Target | Architectural Constraint & Measurement Context |
-| :--- | :--- | :--- | :--- |
-| **Scalability** | `NFR-SCALE-001` | **Base Throughput:** 10,000 req/sec | System handles steady-state browsing, cart additions, and account activity with zero performance degradation. |
-| **Scalability** | `NFR-SCALE-002` | **Peak Flash Throughput:** Up to 500,000 req/sec | Edge, ingress routing, caching, and queue buffering tiers must absorb up to 500k req/sec peak surge during flash launch. |
-| **Scalability** | `NFR-SCALE-003` | **Horizontal Scaling:** Linear compute elasticity | Stateless application services must scale horizontally by adding instances behind load balancers with no shared memory dependency. |
-| **Concurrency** | `NFR-CONC-001` | **Simultaneous Contenders:** 10,000 requests | The system must arbitrate 10,000 simultaneous purchase requests hitting the same SKU without resource starvation or deadlocks. |
-| **Concurrency** | `NFR-CONC-002` | **Allocation Boundary:** Exactly $\le 100$ units | Across 10,000 concurrent attempts, exactly and only 100 units can be reserved; remaining 9,900 requests receive graceful sold-out responses. |
-| **Consistency** | `NFR-CONS-001` | **Inventory Non-Negative:** Invariant ($Stock \ge 0$) | Strong transactional consistency at the reservation boundary. Zero tolerance for negative stock balances under any failure mode. |
-| **Consistency** | `NFR-CONS-002` | **Eventual Consistency:** Downstream tiers | Catalog browsing, analytics, and notification projections may exhibit bounded eventual consistency ($< 2$ seconds). |
-| **Reliability** | `NFR-REL-001` | **Payment Gateway Resilience** | 100% of payment timeouts and gateway drops must route to automated reconciliation or compensations; zero silent losses. |
-| **Reliability** | `NFR-REL-002` | **Downstream Service Outage Resilience** | System buffers confirmed transactions if Order Service suffers a 30-second outage, recovering cleanly without data loss. |
-| **Reliability** | `NFR-REL-003` | **Automated Stock Reclamation** | 100% of expired reservations must be returned to available inventory via reliable background sweeps or event TTLs. |
-| **Availability** | `NFR-AVAIL-001` | **Critical Path Availability:** 99.99% | Discovery and ingress remain operational under surge; inventory boundary prioritizes correctness over raw write acceptance. |
-| **Performance** | `NFR-PERF-001` | **Reservation Latency Target** | P99 latency target of $< 150\text{ ms}$ for inventory reservation operations under peak contention (design target, not SLA guarantee). |
-| **Performance** | `NFR-PERF-002` | **Catalog Read Latency Target** | P95 latency target of $< 30\text{ ms}$ via multi-tier edge and distributed read caching. |
-| **Security** | `NFR-SEC-001` | **Network & Channel Security** | Mandatory TLS 1.3 for all client-to-server and mTLS for all inter-service mesh communications. |
-| **Security** | `NFR-SEC-002` | **Authentication & Authorization** | Cryptographic JWT verification, OAuth2/OIDC, and role-based access control (RBAC) across administrative and checkout APIs. |
-| **Security** | `NFR-SEC-003` | **Perimeter Defense & Abuse Protection** | IP and user-based token bucket rate limiting, bot protection, and WAF rules at ingress to prevent script scraping and DDoS. |
-| **Security** | `NFR-SEC-004` | **Payment Data Protection** | Strict PCI-DSS compliance boundaries. Cardholder data is tokenized; zero raw cardholder data stored on SALESTORM servers. |
-| **Observability** | `NFR-OBS-001` | **Telemetry & Metrics** | Real-time monitoring of ingestion rates, P50/P90/P99 latencies, reservation drop rates, payment failure ratios, and queue depths. |
-| **Observability** | `NFR-OBS-002` | **Distributed Tracing & Structured Logs** | End-to-end W3C distributed trace propagation (`traceparent`) linking edge ingress, reservation, payment, and order records. |
+The system must perform the actual inventory decision at a strongly consistent boundary.
 
----
+## 5.1 Reservation Rules
 
-## 5. Strict Guarantees vs. Engineering Targets
+A reservation should only succeed when sufficient stock exists.
 
-To prevent architectural ambiguity, the table below establishes a strict boundary between non-negotiable invariants and operational design targets:
+The reservation operation must be atomic:
 
-| Dimension | Strict Guarantees (Non-Negotiable Invariants) | Targets / Engineering Goals (Best-Effort Operational Goals) |
-| :--- | :--- | :--- |
-| **Inventory Allocation** | • **Zero Overselling:** Under no circumstances shall total confirmed + active reservations exceed available stock.<br>• **Non-Negative Stock:** Available inventory balance can never drop below zero ($Balance \ge 0$). | • High reservation conversion rate.<br>• Sub-second customer-facing rejection notices when stock reaches zero. |
-| **Transaction Processing** | • **Universal Payment Deduplication:** An idempotency key can never initiate more than one charge on an external gateway.<br>• **Single Order per Checkout:** Duplicate order submissions produce the identical order record without duplicate fulfillment. | • Rapid payment round-trip processing.<br>• Minimal customer checkout abandonment. |
-| **Lifecycle Integrity** | • **State Machine Determinism:** Illegal order/reservation transitions are blocked and logged.<br>• **Guaranteed Reclamation:** Expired or abandoned reservations must eventually be released back to the pool. | • Reservation expiry sweep latency within seconds of TTL breach. |
-| **Fault Recovery** | • **No Payment Abandonment:** Confirmed payments are never dropped, even during downstream Order Service downtime.<br>• **Safe Inventory Compensation:** Failed payments never lock reserved inventory permanently. | • Automated recovery of backlog within 60 seconds of downstream service restoration. |
-| **Scale & Traffic** | *None (System cannot guarantee unlimited traffic intake without perimeter shedding).* | • Sustain ~10,000 req/sec base traffic.<br>• Ingress architecture reasons about absorbing up to 500,000 req/sec flash spikes.<br>• Horizontal scale-out of stateless application nodes. |
-| **Latency & Performance** | *None (Network physics and downstream banking gateways prevent absolute latency guarantees).* | • Sub-150ms P99 target for reservation write contention.<br>• Sub-30ms P95 target for cached product discovery. |
-| **Availability** | • **Correctness Over Blind Availability:** Under extreme partition, the inventory boundary chooses consistency over accepting unverified writes. | • 99.99% uptime for public-facing discovery endpoints.<br>• Graceful degradation with queuing under extreme overload. |
-
----
-
-## 6. Architecture Assumptions
-
-The design of the SALESTORM platform is founded upon the following explicit architectural assumptions:
-
-1. **Definitive Inventory Source of Truth:** A single, authoritative data store (or bounded transactional partition) holds ownership of real-time inventory counts and reservation states.
-2. **Consistency Boundary Isolation:** Concurrency control and consistency enforcement occur strictly at the Inventory/Reservation service boundary, shielding downstream services from write contention.
-3. **Deterministic Expiry Mechanism:** Every reservation possesses an explicit TTL. The architecture assumes an active or passive revocation mechanism will release unconfirmed allocations.
-4. **Client Retries & Network Flakiness:** In high-traffic scenarios, clients will aggressively click buttons multiple times, and network drops will trigger automated client retries.
-5. **Duplicate Ingress Traffic:** Network packet retransmissions and browser retries will introduce duplicate requests across the entire pipeline.
-6. **External Payment Gateway Latency & Flakiness:** The external payment gateway is a third-party dependency subject to network latency, transient timeouts, intermittent rate limiting, and 5xx errors.
-7. **Downstream Service Instability:** Downstream services (e.g., Order Service, Fulfillment Service, Notification Service) are assumed to experience transient outages (e.g., 30-second crash or restart loops).
-8. **Asynchronous Decoupling for Durability:** Message-oriented middleware and asynchronous event streaming can be leveraged to buffer and decouple post-payment workflows safely.
-9. **Stateless Service Tier:** All API routing and business logic services are stateless, externalizing state to distributed caches, transactional stores, and queues.
-10. **Storage Transactional Guarantees:** The underlying persistence engine chosen for inventory and payments must support atomic compare-and-swap, ACID transactions, or distributed serializable isolation levels.
-11. **Idempotency Everywhere:** Idempotency is not an optional optimization; it is a foundational prerequisite implemented at every state-mutating boundary.
-
----
-
-## 7. System Constraints
-
-The architecture must operate within the following boundaries:
-
-* **Extreme Contention on Single SKU:** In flash-sale scenarios, contention is localized to a minuscule fraction of catalog keys (e.g., $10,000$ clients competing for $1$ SKU with $100$ items). Distributed partition sharding by SKU does not relieve hot-key contention on that single item.
-* **Hard Upper-Bound Inventory:** Exactly 100 physical items exist in the warehouse for the critical scenario. No backordering, pre-ordering, or buffer buffers are permitted.
-* **Zero Overselling Tolerance:** Overselling results in legal liability, brand damage, and expensive customer service compensations.
-* **External Payment Black Box:** The system cannot control external payment gateway internal latency, internal queue backlogs, or bank clearing speeds.
-* **Design-First Scope:** Hackathon deliverables prioritize architectural completeness, rigorous trade-off evaluations, mathematical correctness proofs, and state machine designs over raw boilerplate code generation.
-* **Prototype Validation Rule:** Any exploratory code or prototype created in later phases must serve solely to benchmark or validate a specific architectural hypothesis (e.g., lock contention benchmarks, idempotency collision rates).
-
----
-
-## 8. Traffic & Load Model
-
-### 8.1 Load Profiles
-The platform must transition smoothly between three operating regimes:
-
-```
-[ Base Load: ~10,000 req/sec ]
-              │
-              │  (Flash Sale Commences: 50x Surge)
-              ▼
-[ Ingress Flash Load: Up to 500,000 req/sec ]
-              │
-              │  (Perimeter Filtering, Edge Cache, Rate Limiting)
-              ▼
-[ Critical Inventory Contention Boundary: 10,000 concurrent req / single SKU ]
-              │
-              ▼
-[ Successful Allocations: EXACTLY 100 ] ──► [ 9,900 Graceful Rejections ]
+```text
+Check stock
+     ↓
+Reserve stock
+     ↓
+Create reservation
 ```
 
-* **Base Traffic (Steady State):** $\approx 10,000\text{ req/sec}$ across catalog browsing, search, user profiles, and cart management. Read-to-write ratio $\approx 95:5$.
-* **Flash-Sale Surge (Edge Ingress):** Architecture must reason about ingesting, filtering, and shedding traffic for surges reaching up to $500,000\text{ req/sec}$ at the edge gateway. Read-to-write ratio $\approx 80:20$.
-* **Critical Flash Event (Hot-Key Boundary):** $10,000$ concurrent buyers execute checkout simultaneously against a single SKU with exactly $100$ units in stock.
+These operations must behave as one logical transaction.
 
-### 8.2 The Contention Bottleneck
-The core challenge in flash sales is not simple network bandwidth or stateless compute capacity; it is **hot-row write serialization**. 
+Two customers must never be able to observe the same final unit as available and both successfully claim it.
 
-When 10,000 requests attempt to decrement the identical counter concurrently, conventional row-level locking causes severe lock contention, thread starvation, connection pool exhaustion, and cascading database failure. The architecture must decouple request intake from the atomic inventory serialization boundary.
+---
 
-### 8.3 The Mathematical Invariants
+## 5.2 Reservation Lifecycle
+
+The reservation follows a controlled state machine:
+
+```text
+AVAILABLE
+    │
+    │ Reserve
+    ▼
+RESERVED
+    │
+    │ Start Payment
+    ▼
+PAYMENT_PENDING
+    │
+    ├──────── Payment Success ────────► CONFIRMED
+    │                                      │
+    │                                      │ Fulfillment
+    │                                      ▼
+    │                                    SOLD
+    │
+    └──── Payment Failed / Timeout ──► RELEASED
+                                           │
+                                           ▼
+                                      AVAILABLE
+```
+
+### Successful path
+
+```text
+AVAILABLE
+→ RESERVED
+→ PAYMENT_PENDING
+→ CONFIRMED
+→ SOLD
+```
+
+### Payment failure
+
+```text
+RESERVED / PAYMENT_PENDING
+→ PAYMENT_FAILED
+→ RELEASED
+→ AVAILABLE
+```
+
+### Reservation timeout
+
+```text
+RESERVED / PAYMENT_PENDING
+→ TIMEOUT
+→ RELEASED
+→ AVAILABLE
+```
+
+---
+
+## 5.3 Invalid Transitions
+
+The system must reject invalid state changes.
+
+For example:
+
+```text
+RELEASED → CONFIRMED
+AVAILABLE → CONFIRMED
+SOLD → AVAILABLE
+```
+
+A sold item cannot simply become available again. A return or refund process would be required for that scenario.
+
+---
+
+# 6. Checkout
+
+When the customer starts checkout, SALESTORM creates a checkout session containing:
+
+* Customer ID
+* Selected products
+* Quantity
+* Price snapshot
+* Shipping information
+* Active reservation reference
+
+The checkout session should be treated as an immutable record of what the customer is attempting to purchase.
+
+Before payment begins, the system must verify that the reservation:
+
+* Exists
+* Belongs to the customer
+* Has not expired
+* Is still in a valid state
+
+Only then should the payment request be sent.
+
+---
+
+# 7. Payment Processing
+
+Payment is an external dependency, so SALESTORM must assume that it can be slow, unavailable, or uncertain.
+
+## Payment success
+
+When payment is confirmed:
+
+1. The payment record becomes `SETTLED`.
+2. The reservation is confirmed.
+3. An order confirmation event is created.
+4. The order continues through the asynchronous fulfillment pipeline.
+
+## Payment failure
+
+When the gateway clearly rejects the payment:
+
+1. Payment becomes `FAILED`.
+2. The reservation is released.
+3. The inventory becomes available again.
+4. The customer can retry with another payment method.
+
+## Payment timeout
+
+A timeout does **not** automatically mean payment failed.
+
+Instead:
+
+```text
+PAYMENT_PENDING
+       │
+       │ Gateway timeout
+       ▼
+UNKNOWN_PENDING
+       │
+       ├── Payment found → CONFIRMED
+       │
+       └── Payment not found → FAILED → RELEASE
+```
+
+This prevents SALESTORM from accidentally charging a customer twice.
+
+---
+
+# 8. Idempotency
+
+Idempotency is one of the core design principles of SALESTORM.
+
+Customers can double-click buttons. Mobile networks can retry requests. Load balancers can retry failed connections. Services can restart while processing requests.
+
+The system therefore uses an `Idempotency-Key` for state-changing operations.
+
+Examples include:
+
+* Reservation
+* Checkout
+* Payment
+* Order creation
+
+If the same operation is received again, the system should return the result of the original operation instead of performing it again.
+
+For example:
+
+```text
+Request 1
+Idempotency-Key: ABC123
+       ↓
+Reservation created
+
+Request 2
+Idempotency-Key: ABC123
+       ↓
+Return original reservation
+       ↓
+No second reservation
+```
+
+Idempotency keys should be scoped appropriately to the customer and operation and should have a lifecycle matching the transaction.
+
+---
+
+# 9. Order Lifecycle
+
+Orders follow a controlled state machine:
+
+```text
+CREATED
+   │
+   ▼
+PAYMENT_PENDING
+   │
+   ▼
+CONFIRMED
+   │
+   ▼
+PROCESSING
+   │
+   ▼
+SHIPPED
+   │
+   ▼
+OUT_FOR_DELIVERY
+   │
+   ▼
+DELIVERED
+```
+
+The system must reject invalid transitions.
+
+For example:
+
+```text
+CREATED → SHIPPED
+CANCELLED → DELIVERED
+PAYMENT_PENDING → SHIPPED
+```
+
+Every transition should be auditable so that the complete history of an order can be reconstructed.
+
+---
+
+# 10. Fulfillment & Notifications
+
+Once an order is confirmed, fulfillment should happen asynchronously.
+
+The checkout request should not wait for:
+
+* Warehouse processing
+* Shipping label creation
+* Logistics providers
+* Email delivery
+* SMS delivery
+* Push notifications
+
+A confirmed order can instead produce an event such as:
+
+```text
+OrderConfirmedEvent
+        │
+        ├──► Fulfillment Service
+        │
+        ├──► Notification Service
+        │
+        └──► Analytics
+```
+
+If one of these services is temporarily unavailable, the purchase itself should remain unaffected.
+
+---
+
+# 11. Non-Functional Requirements
+
+| Category                   | Target                                          |
+| :------------------------- | :---------------------------------------------- |
+| Base traffic               | ~10,000 requests/sec                            |
+| Flash-sale edge traffic    | Up to 500,000 requests/sec                      |
+| Concurrent buyers          | 10,000                                          |
+| Available stock            | 100 units                                       |
+| Maximum reservations       | 100                                             |
+| Inventory invariant        | Stock must never become negative                |
+| Reservation P99            | <150 ms design target                           |
+| Catalog P95                | <30 ms design target                            |
+| Downstream consistency     | <2 sec where eventual consistency is acceptable |
+| Critical-path availability | 99.99% target                                   |
+| Client communication       | TLS 1.3                                         |
+| Service communication      | mTLS                                            |
+| Authentication             | OAuth2/OIDC + JWT                               |
+| Authorization              | RBAC                                            |
+| Observability              | Metrics + logs + distributed tracing            |
+
+The performance numbers are **engineering targets**, not absolute guarantees.
+
+The most important guarantee remains inventory correctness.
+
+---
+
+# 12. Strict Guarantees vs. Targets
+
+It is important to distinguish between what SALESTORM **must guarantee** and what it is simply **designed to achieve**.
+
+## Strict guarantees
+
+### Inventory
+
+* No overselling
+* Inventory cannot become negative
+* Active reservations + confirmed orders cannot exceed available stock
+
+### Payments
+
+* One checkout cannot result in multiple charges
+* Retries must use the same payment idempotency key
+* Payment timeouts must be reconciled
+
+### Orders
+
+* One checkout produces at most one order
+* Invalid state transitions are rejected
+* Confirmed payments cannot disappear
+
+### Reservations
+
+* Expired reservations must eventually be released
+* Failed payments must release their reservations
+
+### Fault recovery
+
+* A temporary Order Service outage must not lose successful payments
+* Consumers must safely handle duplicate events
+
+---
+
+## Engineering targets
+
+These are important goals but cannot be treated as absolute guarantees:
+
+* 500k requests/sec at the edge
+* <150 ms reservation P99
+* <30 ms catalog P95
+* 99.99% availability
+* Recovery of normal operation within approximately 60 seconds after service restoration
+
+---
+
+# 13. Traffic Model
+
+SALESTORM is designed around three major traffic levels.
+
+```text
+~10k req/sec
+Base traffic
+     │
+     │ Flash sale begins
+     ▼
+~500k req/sec
+Edge traffic
+     │
+     │ Filtering + caching + rate limiting
+     ▼
+10k concurrent requests
+Hot SKU
+     │
+     ▼
+100 successful reservations
+     │
+     ▼
+9,900 rejected requests
+```
+
+The key point is that **the entire 500k req/sec load must not reach the inventory database**.
+
+The edge, cache, rate limiter, waiting room, and queueing layers should absorb and filter traffic before requests reach the critical reservation boundary.
+
+---
+
+# 14. The Hot-Key Problem
+
+The hardest technical problem in SALESTORM is not simply handling large network traffic.
+
+It is handling thousands of writes against the **same inventory item**.
+
+For example:
+
+```text
+10,000 buyers
+      │
+      ▼
+   Same SKU
+      │
+      ▼
+    100 units
+```
+
+Traditional database locking can cause:
+
+* High lock contention
+* Connection pool exhaustion
+* Increased latency
+* Thread starvation
+* Cascading failures
+
+Therefore, the architecture must protect the inventory boundary from uncontrolled concurrency while still preserving atomicity.
+
+---
+
+# 15. Inventory Invariants
+
 Let:
-* $I_0$ be the initial available inventory ($I_0 = 100$).
-* $R(t)$ be the cumulative count of successful inventory reservations granted up to time $t$.
-* $C(t)$ be the cumulative count of confirmed orders settled via payment up to time $t$.
-* $E(t)$ be the cumulative count of expired or cancelled reservations reclaimed up to time $t$.
-* $A(t)$ be the current available stock balance at time $t$.
 
-The system strictly enforces the following invariant for all $t$:
+* `I₀` = initial inventory
+* `R(t)` = successful reservations
+* `E(t)` = released or expired reservations
+* `A(t)` = currently available inventory
 
-$$A(t) = I_0 - [R(t) - E(t)] \ge 0$$
+Then:
 
-$$R(t) - E(t) \le I_0$$
+```text
+A(t) = I₀ - [R(t) - E(t)]
+```
 
-$$C(t) \le I_0$$
+And the system must always maintain:
 
-For the benchmark critical scenario ($I_0 = 100$):
+```text
+A(t) >= 0
+```
 
-$$\text{Successful Active Reservations} \le 100$$
-$$\text{Total Sold Items } (C) \le 100$$
-$$\text{Total Oversold Items } \equiv 0$$
+For the benchmark:
 
----
+```text
+I₀ = 100
+```
 
-## 9. Critical Business Invariants
+Therefore:
 
-The following nine invariants must be maintained across all system states, failures, and network partitions:
+```text
+Active reservations <= 100
+Confirmed orders <= 100
+Oversold items = 0
+```
 
-1. **Inventory Non-Negativity:** Physical inventory balances must never drop below zero under any concurrency or race condition.
-2. **Bounded Reservation Volume:** Total active reservations plus settled orders can never exceed the configured stock threshold.
-3. **Singular Idempotency Mapping:** Exactly one business state change can be associated with a single idempotency key. Duplicate submissions must return identical output with zero side effects.
-4. **Zero Double-Billing:** A customer transaction can never be submitted to the payment gateway more than once for a single checkout session.
-5. **Single Order Guarantee:** A single checkout session and payment authorization cannot generate more than one confirmed order record.
-6. **Guaranteed Stock Reclamation:** Any inventory held under a reservation that is abandoned, timed out, or associated with a failed payment must be returned to the available inventory pool.
-7. **Strict State Machine Validity:** Order and reservation records can only transition through formally defined valid paths. Out-of-order and illegal transitions must fail closed.
-8. **Durable Payment Settlement:** Once payment authorization succeeds, the order state must not be lost, even if the Order Service or database crashes immediately post-payment.
-9. **No Ghost Inventory Locks:** Unsuccessful or aborted payment attempts must never permanently lock or isolate stock.
+These are core correctness properties of the system.
 
 ---
 
-## 10. System Dependencies
+# 16. Architecture Assumptions
 
-### 10.1 Internal Service Dependencies
+The design is based on the following assumptions:
 
-| Service / Component | Architectural Role | Critical Path Sync Dependency? | Failure Mode & Required Degradation Behavior |
-| :--- | :--- | :--- | :--- |
-| **Product Service** | Catalog metadata, media, and pricing. | **No** (Discovery only) | Serve from edge/regional read caches. If origin fails, serve stale cached metadata; disable price edits. |
-| **Cart Service** | Holds pre-checkout customer intent. | **No** (Pre-checkout) | Client-side local storage backup; degraded cart save. Does not block direct flash-sale checkout. |
-| **Sale Service** | Manages flash-sale schedules and eligibility. | **No** (Read-heavy) | Cached rule evaluation at edge/gateway. Fails closed if pricing or schedule validation cannot be verified. |
-| **Inventory / Reservation Service** | Source of truth for atomic stock and reservations. | **YES (Critical Path)** | Highly resilient transactional boundary. If unavailable, checkout fails fast with "Try again" (never oversells). |
-| **Checkout Service** | Orchestrates checkout validation and session tokens. | **YES (Critical Path)** | Returns structured error. Fails fast without executing partial transactions. |
-| **Payment Service** | Interface to payment gateways and tokenization. | **YES (Critical Path)** | Enforces strict timeouts and idempotent retries. Never reports false success. |
-| **Order Service** | Manages order creation and lifecycle state. | **NO (Asynchronous Post-Payment)** | If down, payment completion events are buffered in persistent message queues; recovered upon restart. |
-| **Shipment Service** | Interfaces with 3PL logistics carriers. | **No** (Asynchronous) | Buffered in message broker; retryable background jobs. Zero impact on customer purchase flow. |
-| **Notification Service** | Customer messaging (email, SMS, push). | **No** (Asynchronous) | Buffered in message broker; dropped or retried without impacting transactions. |
-| **Primary Database** | Authoritative transactional persistence. | **YES (Critical Path)** | High availability with primary-replica failover. Fails closed on total loss. |
-| **Distributed Cache** | Edge/read acceleration and hot-key buffering. | **Conditional** | Cache-aside for reads; if cache fails, system sheds load to protect database origin. |
-| **Message Broker** | Asynchronous durable messaging between services. | **Conditional (Post-Payment)** | High-availability distributed log. If unavailable, publishers buffer locally or reject new checkouts safely. |
+### 1. Inventory has one authoritative source
 
-### 10.2 External Dependencies
+A single transactional boundary owns the real-time inventory state.
 
-| Dependency | Purpose | Critical Path Sync Dependency? | Failure Behavior & Mitigation |
-| :--- | :--- | :--- | :--- |
-| **Payment Gateway** | Card processing, digital wallets, bank authorization. | **YES** | Gateway timeout / outage handled via circuit breakers, idempotent status polling, and automated reconciliation. |
-| **Logistics Carrier / 3PL** | Shipping label generation, manifest dispatch. | **No** | Asynchronous batch polling or webhook integration. Isolated from purchase path. |
-| **Third-Party Notification Provider** | SMS/Email dispatch gateways (e.g., Twilio, SendGrid). | **No** | Asynchronous delivery queues with dead-letter queue (DLQ) support. |
+### 2. Inventory consistency is isolated
 
----
+The Inventory/Reservation service is responsible for concurrency control rather than allowing every service to modify stock directly.
 
-## 11. Failure Modes & Required System Behavior
+### 3. Reservations have an explicit TTL
 
-The requirements specify explicit, deterministic system responses for each failure mode:
+Every temporary reservation has an expiry time.
 
-### 11.1 Payment Failure
-* **Scenario:** External payment gateway explicitly rejects the charge (e.g., insufficient funds, card declined).
-* **Required Behavior:** 
-  1. Payment Service marks transaction as `FAILED`.
-  2. Inventory Service receives immediate compensation event to transition reservation from `PAYMENT_PENDING` $\rightarrow$ `RELEASED`.
-  3. Available inventory is incremented back by the reserved amount.
-  4. Checkout UI notifies customer with clear failure reason; cart remains intact for retry with alternative payment method.
+### 4. Duplicate requests are normal
 
-### 11.2 Payment Timeout
-* **Scenario:** Payment Service dispatches authorization request to payment gateway, but the connection drops or times out after $X$ seconds with no response.
-* **Required Behavior:** 
-  1. Transaction state transitions to `PAYMENT_UNKNOWN_TIMEOUT`.
-  2. System initiates an idempotent background verification/status query to the gateway.
-  3. If payment was settled, order is marked `CONFIRMED`.
-  4. If payment was never processed, payment is formally cancelled and reservation is reclaimed.
-  5. Customer is notified of pending confirmation rather than double-charged.
+Users and networks will retry requests. The architecture must expect this rather than treat it as an exceptional case.
 
-### 11.3 Duplicate Payment Request
-* **Scenario:** Client browser or malicious script sends multiple identical payment authorization requests for the same checkout session.
-* **Required Behavior:** 
-  1. Payment Service verifies the unique `Idempotency-Key` or `CheckoutSessionId`.
-  2. Active in-flight lock rejects concurrent identical requests with HTTP `409 Conflict`.
-  3. Subsequent completed queries return the exact cached result of the first authorization without re-contacting the gateway.
+### 5. Payment gateways can fail
 
-### 11.4 Duplicate Buy / Reservation Request
-* **Scenario:** User aggressively double-clicks "Buy Now", or automated bots fire concurrent reservation requests for the same user session.
-* **Required Behavior:** 
-  1. Ingress/Reservation boundary validates `(UserId, FlashSaleId, SKU)`.
-  2. Only the first atomic acquisition succeeds; the duplicate invocation is recognized as a duplicate and either bound to the existing reservation or gracefully rejected.
-  3. A single user cannot consume multiple units unless explicitly permitted by business policy.
+Payment providers may timeout, return errors, become rate-limited, or temporarily go offline.
 
-### 11.5 Order Service 30-Second Outage Post-Payment
-* **Scenario:** Payment gateway successfully authorizes and settles payment, but the internal Order Service crashes or undergoes a 30-second restart before the order record is written.
-* **Required Behavior:** 
-  1. Payment Service publishes an immutable `PaymentSettledEvent` to a durable, persistent distributed message log.
-  2. The message remains unacknowledged in the broker while the Order Service is offline.
-  3. Upon Order Service recovery (at $t = 30\text{s}$), the consumer resumes processing the queue, writes the `CONFIRMED` order, and acknowledges the message.
-  4. Zero customer payments are lost or orphaned.
+### 6. Internal services can fail
 
-### 11.6 Database Partition / Primary Failure
-* **Scenario:** Primary database node experiences hardware failure or network split during peak reservation operations.
-* **Required Behavior:** 
-  1. Automated health checks initiate failover to standby replica.
-  2. During the split-brain / failover window, in-flight write operations fail fast with HTTP `503 Service Unavailable`.
-  3. Under no condition does the system fall back to an uncoordinated secondary that permits duplicate reservations or dirty reads. Consistency takes absolute precedence over write availability.
+Order, fulfillment, notification, and other services may experience temporary outages.
 
-### 11.7 Message Processing Failure (Consumer Crash)
-* **Scenario:** Downstream consumer crashes mid-processing of an event (e.g., during fulfillment notification).
-* **Required Behavior:** 
-  1. Unacknowledged message is redelivered to an alternative consumer instance after visibility timeout.
-  2. Consumer enforces consumer-side idempotency using the event's unique message ID.
-  3. Repeatedly failing messages are routed to a Dead Letter Queue (DLQ) with alert triggers after max retry threshold.
+### 7. Messaging can be used for durability
 
-### 11.8 External Dependency Failure (Complete Gateway Down)
-* **Scenario:** External payment provider suffers an extended regional outage.
-* **Required Behavior:** 
-  1. Circuit breaker trips open after reaching configured failure threshold.
-  2. System gracefully informs customers entering checkout that payment processing is temporarily degraded.
-  3. System halts new reservations for that payment method rather than locking inventory in indefinitely pending states.
+Durable asynchronous messaging is available for workflows that do not require an immediate response.
 
-### 11.9 Reservation Expiry (TTL Elapsed)
-* **Scenario:** Customer reserves stock, receives a reservation token, but closes the browser or abandons the payment window.
-* **Required Behavior:** 
-  1. Reservation time-to-live expires.
-  2. Automated scheduler or reactive reconciliation identifies the expired reservation.
-  3. State updates from `RESERVED` $\rightarrow$ `RELEASED`.
-  4. Available inventory is atomically restored.
-  5. Stale client attempting payment post-expiry is rejected with an `EXPIRED_RESERVATION` error.
+### 8. Application services are stateless
 
-### 11.10 Massive Traffic Spike (500k req/sec Surge)
-* **Scenario:** 500,000 requests hit the platform in the first 5 seconds of the flash sale.
-* **Required Behavior:** 
-  1. Edge CDN and API Gateway absorb and rate-limit anomalous IPs and unauthorized traffic.
-  2. Static catalog assets served from distributed cache.
-  3. Fair queue or token-bucket rate limiter admits only manageable batches to the transactional reservation boundary.
-  4. Overflow requests receive structured, friendly "In Waiting Room" or "Sale Sold Out" responses without crashing upstream core databases.
+Session and transaction state is stored outside application instances.
+
+### 9. The transactional store supports strong concurrency guarantees
+
+The chosen persistence technology must support atomic operations and appropriate transactional isolation.
+
+### 10. Idempotency is required throughout the transaction flow
+
+Every state-changing boundary must be designed to safely handle retries.
 
 ---
 
-## 12. Out of Scope for This Document
+# 17. System Constraints
 
-To preserve the integrity of the design-first methodology, the following technical and implementation decisions are **strictly out of scope** for this document:
+SALESTORM operates under several hard constraints.
 
-* **Specific Database Engine Selection:** No final determination of PostgreSQL, MySQL, CockroachDB, Cassandra, DynamoDB, or Spanner.
-* **Specific Message Broker Selection:** No final determination of Apache Kafka, RabbitMQ, AWS SQS/SNS, or NATS.
-* **Specific Caching & In-Memory Store Technology:** No final determination of Redis, Memcached, Dragonfly, or Hazelcast.
-* **Specific Concurrency Implementation Mechanics:** No final commitment to Redis Lua scripts, distributed Redlock, optimistic locking (`SELECT FOR UPDATE`), or saga orchestrators.
-* **Specific Cloud Vendor & Orchestration Tools:** No binding to AWS, GCP, Azure, Kubernetes, or Serverless.
-* **Detailed Code & Implementation Artifacts:** No concrete programming language syntax, ORM entity definitions, or service class implementations.
-* **Concrete REST/gRPC/GraphQL Schemas:** Exact JSON/Protobuf schemas will be defined in `05_API/`.
-* **Database DDL & Relational Schemas:** Specific table schemas, indexing strategies, and partitioning rules will be defined in `04_Database/`.
+### Single hot SKU
 
-*All above concerns are reserved for subsequent HLD, LLD, Database, API, and Architecture Decision Records (ADR).*
+The benchmark intentionally creates extreme contention on one product. Adding more database shards does not automatically solve contention when all requests target the same SKU.
 
----
+### Fixed physical inventory
 
-## 13. Requirement Traceability Matrix
+The benchmark has exactly 100 physical units.
 
-The following matrix establishes end-to-end traceability for 28 core requirements across priority, guarantee classification, and downstream design artifacts:
+There is:
 
-| Requirement ID | Domain | Requirement Description | Priority | Guarantee Type | Downstream Design Artifact |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **FR-DISC-001** | Discovery | Support browse and catalog retrieval | High | Target | `02_HLD`, `05_API` |
-| **FR-DISC-003** | Discovery | Expose stock availability indicators | High | Target | `02_HLD`, `05_API` |
-| **FR-CART-001** | Cart | Maintain persistent user cart state | Medium | Target | `03_LLD`, `04_Database` |
-| **FR-INV-001** | Inventory | Real-time atomic inventory balance checks | Critical | **Strict Guarantee** | `02_HLD`, `03_LLD`, `04_Database` |
-| **FR-INV-002** | Inventory | Atomic inventory reservation decrements | Critical | **Strict Guarantee** | `02_HLD`, `03_LLD`, `10_ADR` |
-| **FR-INV-003** | Inventory | Confirm reservation upon verified payment | Critical | **Strict Guarantee** | `03_LLD`, `04_Database` |
-| **FR-INV-004** | Inventory | Release reservation on payment rejection | Critical | **Strict Guarantee** | `03_LLD`, `08_Scalability_Reliability` |
-| **FR-INV-005** | Inventory | Automatic reclamation of expired reservations | Critical | **Strict Guarantee** | `03_LLD`, `08_Scalability_Reliability` |
-| **FR-INV-006** | Inventory | Guarantee inventory balance never negative | Critical | **Strict Guarantee** | `02_HLD`, `04_Database`, `10_ADR` |
-| **FR-RES-001** | Reservation | Deterministic reservation state machine | Critical | **Strict Guarantee** | `03_LLD`, `04_Database` |
-| **FR-RES-002** | Reservation | Bound reservation duration via explicit TTL | Critical | Target | `03_LLD`, `10_ADR` |
-| **FR-CHK-001** | Checkout | Immutable Checkout Session creation | High | Target | `03_LLD`, `05_API` |
-| **FR-CHK-002** | Checkout | Enforce active reservation prior to payment | Critical | **Strict Guarantee** | `03_LLD`, `05_API` |
-| **FR-PAY-001** | Payment | Idempotent payment authorization handling | Critical | **Strict Guarantee** | `03_LLD`, `05_API`, `10_ADR` |
-| **FR-PAY-002** | Payment | Automated payment reconciliation workflow | High | **Strict Guarantee** | `08_Scalability_Reliability` |
-| **FR-ORD-001** | Order | Strict order state machine transitions | Critical | **Strict Guarantee** | `03_LLD`, `04_Database` |
-| **FR-ORD-002** | Order | Zero payment-order drop during service downtime| Critical | **Strict Guarantee** | `02_HLD`, `08_Scalability_Reliability` |
-| **FR-FUL-001** | Fulfillment | Event-driven fulfillment initiation | Medium | Target | `02_HLD`, `03_LLD` |
-| **FR-NOTIF-001**| Notification | Asynchronous non-blocking customer alerts | Low | Target | `02_HLD`, `08_Scalability_Reliability` |
-| **FR-IDEM-001** | Idempotency | Universal Idempotency-Key support on writes | Critical | **Strict Guarantee** | `03_LLD`, `05_API`, `10_ADR` |
-| **NFR-SCALE-001**| Scalability | Sustain 10k req/sec base traffic | High | Target | `02_HLD`, `08_Scalability_Reliability` |
-| **NFR-SCALE-002**| Scalability | Absorb up to 500k req/sec peak flash surge | High | Target | `02_HLD`, `08_Scalability_Reliability` |
-| **NFR-CONC-001** | Concurrency | Arbitrate 10k concurrent requests on 100 units| Critical | **Strict Guarantee** | `02_HLD`, `03_LLD`, `10_ADR` |
-| **NFR-CONS-001** | Consistency | Strong consistency at reservation boundary | Critical | **Strict Guarantee** | `04_Database`, `10_ADR` |
-| **NFR-REL-001** | Reliability | Automated recovery from payment timeouts | Critical | **Strict Guarantee** | `08_Scalability_Reliability` |
-| **NFR-REL-002** | Reliability | Survive 30s downstream Order Service outage | High | **Strict Guarantee** | `02_HLD`, `08_Scalability_Reliability` |
-| **NFR-SEC-001** | Security | Tokenized payment handling (PCI-DSS) | Critical | **Strict Guarantee** | `09_Security_Observability` |
-| **NFR-OBS-001** | Observability | End-to-end distributed tracing across boundary| High | Target | `09_Security_Observability` |
+* No backordering
+* No pre-ordering
+* No hidden inventory buffer
+
+### Zero overselling tolerance
+
+Selling more units than physically available is considered a system failure.
+
+### External payment dependency
+
+SALESTORM cannot control the payment gateway's internal processing time or availability.
+
+### Design-first scope
+
+The hackathon focuses primarily on architecture, correctness, trade-offs, and failure handling rather than generating a complete production application.
+
+Any prototype code should be used to validate architectural assumptions, such as:
+
+* Lock contention
+* Reservation throughput
+* Idempotency behavior
+* Failure recovery
 
 ---
 
-## 14. Acceptance Criteria
+# 18. Service Dependencies
 
-The system architecture and its subsequent designs shall be deemed acceptable if and only if they demonstrate clear, verifiable mechanisms satisfying the following twelve criteria:
+| Service              | Responsibility                | Checkout Critical? | Failure Handling                             |
+| :------------------- | :---------------------------- | :----------------- | :------------------------------------------- |
+| Product Service      | Catalog and pricing           | No                 | Serve cached data                            |
+| Cart Service         | Customer cart                 | No                 | Degrade gracefully                           |
+| Sale Service         | Sale schedule and eligibility | No                 | Cache rules; fail closed when required       |
+| Inventory Service    | Reservations and stock        | **Yes**            | Fail closed to protect inventory             |
+| Checkout Service     | Checkout orchestration        | **Yes**            | Reject safely if validation fails            |
+| Payment Service      | Payment processing            | **Yes**            | Timeout, retry, reconcile                    |
+| Order Service        | Order lifecycle               | No                 | Consume durable events after recovery        |
+| Fulfillment Service  | Warehouse/shipping flow       | No                 | Queue and retry                              |
+| Notification Service | Email/SMS/Push                | No                 | Queue and retry                              |
+| Database             | Transactional source of truth | **Yes**            | Failover; reject writes during unsafe states |
+| Cache                | Read acceleration             | Conditional        | Shed load if unavailable                     |
+| Message Broker       | Durable events                | Conditional        | Buffer/retry or reject safely                |
 
-1. **Massive Concurrency Arbitration:** The architecture demonstrates how 10,000 concurrent purchase requests enter the system without causing connection pool depletion, server crashes, or unbounded memory usage.
-2. **Absolute Overselling Prevention:** In the benchmark scenario (10,000 requests for 100 units), the architecture guarantees that no more than 100 reservations are granted.
-3. **Mathematical Invariant Preservation:** The system demonstrates how inventory balances are physically prevented from dipping below zero ($Stock \ge 0$).
-4. **Idempotency Across Replays:** Repeated submissions of identical reservation, payment, or order creation requests return identical responses with zero duplicate state mutations.
-5. **Prompt Compensation on Failure:** When a payment fails or is rejected, the architecture guarantees the associated reservation is reclaimed and restored to stock.
-6. **Robust Timeout Reconciliation:** A gateway timeout or unacknowledged payment response is automatically resolved via an auditable reconciliation path.
-7. **Downstream Outage Survival:** A simulated 30-second complete outage of the Order Service during payment completion results in zero lost orders and complete recovery upon service restart.
-8. **Exhaustion Handling:** When stock reaches zero, all subsequent reservation attempts are immediately rejected with clean, low-latency "Sold Out" signals.
-9. **Automated Expiry Reclamation:** Abandoned reservations with expired TTLs have their inventory restored reliably to the available pool.
-10. **Stateless Horizontal Elasticity:** The design demonstrates how application service instances can scale out linearly behind load balancers.
-11. **Comprehensive Observability:** Every transaction is traceable via a unique correlation ID from ingress edge to database commit and downstream messaging.
-12. **Rigorous Security Boundaries:** Architecture defines authentication, authorization, rate limiting, and tokenized payment boundaries adhering to zero-trust principles.
+---
+
+# 19. Failure Scenarios
+
+SALESTORM should be designed around failure rather than treating failure as an edge case.
+
+## Payment failure
+
+```text
+Payment rejected
+      ↓
+Payment = FAILED
+      ↓
+Release reservation
+      ↓
+Return stock
+      ↓
+Customer can retry
+```
 
 ---
 
-## 15. Architectural Design Principles
+## Payment timeout
 
-The design of SALESTORM in all downstream documents (`02_HLD` through `10_ADR`) must adhere to these ten architectural principles:
+```text
+Gateway timeout
+      ↓
+Payment = UNKNOWN
+      ↓
+Reconcile with gateway
+      │
+      ├── Settled → Confirm order
+      │
+      └── Not settled → Release reservation
+```
 
-1. **Correctness Over Blind Availability at the Reservation Boundary:** Under extreme write contention, preserving inventory integrity ($Stock \ge 0$) is paramount. Dropping or shedding excessive traffic is preferable to overselling stock.
-2. **Universal Idempotency for Mutating Operations:** Every state-altering API call must be designed under the assumption that network drops will trigger client and system retries.
-3. **Single Ownership of Bounded Business State:** Each aggregate root (Inventory, Order, Payment) is owned by exactly one bounded context and service. Direct cross-database writes are prohibited.
-4. **Synchronous Processing Only for Immediate Correctness:** Synchronous blocking request-response cycles are restricted solely to operations requiring atomic validation (e.g., inventory reservation decrement).
-5. **Asynchronous Processing for Resilience & Decoupling:** All post-reservation and post-payment workflows (order dispatch, fulfillment, notifications, analytics) must be decoupled via durable message brokers.
-6. **Statelessness in the Compute Tier:** No application node shall maintain session-affinity or in-memory transaction states that prevent arbitrary instance termination or horizontal auto-scaling.
-7. **Explicit Failure & Compensation Modeling:** Every happy-path transaction must have an explicitly documented compensation, timeout, and recovery flow.
-8. **Full-Spectrum Observability by Design:** Logs, metrics, and distributed trace headers must be first-class architectural components, not operational afterthoughts.
-9. **Defensible Trade-Offs for Major Decisions:** Every architectural decision (e.g., lock-free counters vs. ACID transactions, cache invalidation vs. TTLs) must be justified via an Architecture Decision Record (ADR) analyzing pros, cons, and alternatives.
-10. **Clarity & Implementability:** The architecture must be lucid, precise, and easily understood by the entire engineering organization, providing clear guidelines for implementation.
+The system must never blindly retry a payment as a new transaction.
 
 ---
-*End of Document — Proceed to `02_HLD/` for High-Level Architectural Design.*
+
+## Duplicate payment
+
+Multiple requests for the same checkout should resolve to the same payment transaction.
+
+```text
+Request A ──┐
+            ├──► Same Idempotency Key
+Request B ──┘
+                  │
+                  ▼
+             One payment
+```
+
+---
+
+## Duplicate reservation
+
+If the same customer repeatedly clicks Buy:
+
+```text
+Request 1 → Reservation created
+
+Request 2 → Existing reservation returned
+
+Request 3 → Existing reservation returned/rejected
+```
+
+The exact behavior can depend on the business policy, but it must never consume additional inventory unintentionally.
+
+---
+
+## Order Service outage
+
+If payment succeeds while Order Service is unavailable:
+
+```text
+Payment Gateway
+      ↓
+Payment Service
+      ↓
+PaymentSettledEvent
+      ↓
+Durable Message Broker
+      ↓
+Order Service unavailable
+      ↓
+30 seconds later
+      ↓
+Order Service recovers
+      ↓
+Event consumed
+      ↓
+Order created
+```
+
+The event remains durable until it has been successfully processed.
+
+---
+
+## Database failure
+
+If the primary database becomes unavailable:
+
+```text
+Database failure
+      ↓
+Failover / health check
+      ↓
+Unsafe writes rejected
+      ↓
+No uncontrolled secondary writes
+      ↓
+Recovery
+      ↓
+Normal processing resumes
+```
+
+During the failover window, rejecting a transaction is preferable to risking incorrect inventory.
+
+---
+
+## Consumer failure
+
+If a service crashes while processing a message:
+
+```text
+Message
+   ↓
+Consumer
+   ↓
+Consumer crashes
+   ↓
+Message becomes available again
+   ↓
+Another consumer retries
+```
+
+Consumer-side idempotency ensures that processing the message again does not create duplicate side effects.
+
+Repeated failures should eventually move the message to a Dead Letter Queue.
+
+---
+
+## Payment Gateway outage
+
+If the payment provider is completely unavailable:
+
+1. Circuit breaker opens.
+2. New payment attempts are restricted.
+3. Customers receive a clear temporary-unavailability message.
+4. The system avoids holding inventory indefinitely.
+5. Existing pending payments continue through reconciliation.
+
+---
+
+## Reservation expiry
+
+When the reservation TTL expires:
+
+```text
+Reservation expires
+       ↓
+Expiry worker/reconciliation
+       ↓
+RESERVED → RELEASED
+       ↓
+Inventory restored
+       ↓
+AVAILABLE
+```
+
+A customer attempting to pay using an expired reservation must receive an `EXPIRED_RESERVATION` response.
+
+---
+
+## 500k req/sec flash spike
+
+The edge layer should handle the majority of the surge before it reaches the core transactional system.
+
+```text
+500k req/sec
+     ↓
+CDN / WAF
+     ↓
+Rate Limiting
+     ↓
+Bot Protection
+     ↓
+Waiting Room / Queue
+     ↓
+Manageable traffic
+     ↓
+Reservation Service
+```
+
+Customers who cannot be admitted immediately should receive a controlled waiting-room or sold-out response rather than causing the core system to collapse.
+
+---
+
+# 20. Out of Scope
+
+The following decisions are intentionally left for the later architecture documents:
+
+* Exact database technology
+* Exact message broker
+* Exact caching technology
+* Specific locking/concurrency mechanism
+* Cloud provider
+* Kubernetes or serverless platform
+* Programming language
+* ORM implementation
+* Database DDL
+* Exact REST/gRPC/GraphQL schemas
+* Production application code
+
+These decisions will be covered in the HLD, LLD, Database, API, Scalability, Security, and ADR documents.
+
+---
+
+# 21. Requirement Traceability
+
+The major requirements will be traced through the downstream design documents.
+
+| Requirement                   | Priority | Guarantee  | Main Design Area     |
+| :---------------------------- | :------- | :--------- | :------------------- |
+| Catalog access                | High     | Target     | HLD / API            |
+| Persistent cart               | Medium   | Target     | LLD / Database       |
+| Atomic inventory check        | Critical | **Strict** | HLD / LLD / Database |
+| Atomic reservation            | Critical | **Strict** | HLD / LLD / ADR      |
+| Reservation confirmation      | Critical | **Strict** | LLD / Database       |
+| Reservation release           | Critical | **Strict** | LLD / Reliability    |
+| Expiry reclamation            | Critical | **Strict** | LLD / Reliability    |
+| Non-negative inventory        | Critical | **Strict** | HLD / Database / ADR |
+| Reservation state machine     | Critical | **Strict** | LLD                  |
+| Checkout validation           | Critical | **Strict** | LLD / API            |
+| Payment idempotency           | Critical | **Strict** | LLD / API / ADR      |
+| Payment reconciliation        | High     | **Strict** | Reliability          |
+| Order state machine           | Critical | **Strict** | LLD / Database       |
+| Payment-to-order durability   | Critical | **Strict** | HLD / Reliability    |
+| Event-driven fulfillment      | Medium   | Target     | HLD / LLD            |
+| Async notifications           | Low      | Target     | HLD / Reliability    |
+| Universal idempotency         | Critical | **Strict** | LLD / API / ADR      |
+| 10k req/sec base traffic      | High     | Target     | HLD / Scalability    |
+| 500k req/sec edge surge       | High     | Target     | HLD / Scalability    |
+| 10k concurrent buyers         | Critical | **Strict** | HLD / LLD / ADR      |
+| Strong inventory consistency  | Critical | **Strict** | Database / ADR       |
+| Payment failure recovery      | Critical | **Strict** | Reliability          |
+| Order-service outage recovery | High     | **Strict** | HLD / Reliability    |
+| Secure payment boundary       | Critical | **Strict** | Security             |
+| Distributed tracing           | High     | Target     | Observability        |
+
+---
+
+# 22. Acceptance Criteria
+
+The architecture will be considered successful if it can clearly demonstrate the following:
+
+### 1. Handle 10,000 concurrent buyers
+
+The system should absorb the requests without exhausting database connections, application memory, or server resources.
+
+### 2. Never oversell
+
+With 100 units and 10,000 buyers, no more than 100 reservations can succeed.
+
+### 3. Preserve the inventory invariant
+
+At every point:
+
+```text
+Stock >= 0
+```
+
+### 4. Handle retries safely
+
+Repeated reservation, payment, and order requests must not create duplicate side effects.
+
+### 5. Release failed reservations
+
+When payment fails, the reserved inventory must eventually become available again.
+
+### 6. Recover payment timeouts
+
+Unknown payment states must be reconciled rather than blindly retried.
+
+### 7. Survive downstream outages
+
+A 30-second Order Service outage after successful payment must not result in a lost order.
+
+### 8. Handle sold-out conditions
+
+Once the 100 available units are allocated, subsequent requests should receive a clear and low-latency sold-out response.
+
+### 9. Reclaim expired reservations
+
+Abandoned reservations must eventually return their inventory.
+
+### 10. Scale horizontally
+
+Stateless services should be able to scale by adding more instances.
+
+### 11. Provide end-to-end visibility
+
+Each transaction should be traceable from the initial request through reservation, payment, order creation, and downstream events.
+
+### 12. Maintain strong security boundaries
+
+Authentication, authorization, rate limiting, service identity, and payment-tokenization boundaries must be clearly defined.
+
+---
+
+# 23. Architectural Principles
+
+All subsequent SALESTORM architecture documents should follow these principles.
+
+### 1. Correctness comes first
+
+At the inventory boundary, rejecting excess traffic is always preferable to overselling.
+
+### 2. Assume retries
+
+Every state-changing operation should be designed with retries and duplicate requests in mind.
+
+### 3. Give each service clear ownership
+
+Inventory, Payment, and Order state should each have a clearly defined owner. Services should not directly modify another service's database.
+
+### 4. Keep synchronous operations limited
+
+Use synchronous communication where an immediate correctness decision is required, especially during inventory reservation.
+
+### 5. Use asynchronous processing where possible
+
+Fulfillment, notifications, analytics, and other downstream workflows should be event-driven.
+
+### 6. Keep application services stateless
+
+No application instance should depend on local memory for critical transaction state.
+
+### 7. Design for failure
+
+Every important workflow should define what happens when it succeeds, fails, times out, or is interrupted halfway through.
+
+### 8. Build observability into the architecture
+
+Logs, metrics, traces, audit events, and correlation IDs should be part of the design from the beginning.
+
+### 9. Document important trade-offs
+
+Major architectural choices should be captured through ADRs, including the alternatives considered and why a particular approach was selected.
+
+### 10. Keep the design implementable
+
+The final architecture should not only look good on a diagram. Every major component should have a clear responsibility and a practical path to implementation.
+
+---
+
+# Final Design Principle
+
+The most important idea behind SALESTORM is simple:
+
+> **When 10,000 customers compete for 100 products, the system does not need to make everyone successful. It needs to make the outcome correct.**
+
+The architecture should therefore prioritize:
+
+**Correct inventory → Safe payments → Durable orders → Reliable recovery → Scalability**
+
+Everything else should support these goals.
+
+---
+
+**Next:** Proceed to `02_HLD/` for the High-Level Architecture.
